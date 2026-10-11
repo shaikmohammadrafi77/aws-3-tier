@@ -1,0 +1,65 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: savoria-api
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: cd backend && npm ci
+      - run: cd backend && npm test --if-present
+
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push API image
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          docker build -t $IMAGE ./backend
+          docker push $IMAGE
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Update ECS service
+        run: |
+          TASK=$(aws ecs describe-task-definition --task-definition savoria-api --query taskDefinition)
+          NEW_TASK=$(echo $TASK | jq --arg IMAGE "$IMAGE" '.containerDefinitions[0].image = $IMAGE')
+          aws ecs register-task-definition --cli-input-json "$NEW_TASK"
+          aws ecs update-service \
+            --cluster savoria-production \
+            --service savoria-api \
+            --task-definition savoria-api
+
+      - name: Build & Deploy Frontend
+        run: |
+          cd frontend
+          npm ci
+          VITE_API_URL=https://your-cloudfront-url/api npm run build
+          aws s3 sync dist/ s3://savoria-production-frontend --delete
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DIST_ID }} \
+            --paths '/*'
